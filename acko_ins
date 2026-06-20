@@ -1,0 +1,539 @@
+!pip install -q langchain
+!pip install -q langchain-community
+!pip install -q langchain-chroma
+!pip install -q langchain-huggingface
+!pip install -q langchain-google-genai
+!pip install -q chromadb
+!pip install -q sentence-transformers
+!pip install -q pypdf
+
+import os
+os.environ["GOOGLE_API_KEY"] = "AQ.Ab8RN6KyhIzHOiAfHK0zqoMt3dyWh08Uj4IG83gHwaMWt3TNfw"
+from langchain_community.document_loaders import PyPDFLoader
+
+faq_docs = PyPDFLoader(
+    "Acko_Insurance_FAQs.pdf"
+).load()
+
+motor_docs = PyPDFLoader(
+    "Acko_Motor_Insurance_Policy_TC.pdf"
+).load()
+
+health_docs = PyPDFLoader(
+    "Acko_Health_Insurance_Policy_TC.pdf"
+).load()
+
+print("FAQ Pages:", len(faq_docs))
+print("Motor Pages:", len(motor_docs))
+print("Health Pages:", len(health_docs))
+
+  import re
+from langchain_core.documents import Document
+
+faq_text = "\n".join(
+    [doc.page_content for doc in faq_docs]
+)
+
+pattern = r"(Q\s+[A-Z]\d+\..*?)(?=Q\s+[A-Z]\d+\.|$)"
+
+faq_chunks = re.findall(
+    pattern,
+    faq_text,
+    flags=re.DOTALL
+)
+
+faq_documents = []
+
+for i, chunk in enumerate(faq_chunks):
+
+    faq_documents.append(
+        Document(
+            page_content=chunk,
+            metadata={
+                "source":"FAQ",
+                "chunk_id":i
+            }
+        )
+    )
+
+print("FAQ Chunks:", len(faq_documents))
+
+  motor_text = "\n".join(
+    [doc.page_content for doc in motor_docs]
+)
+
+motor_sections = re.split(
+    r"CHAPTER\s+\d+",
+    motor_text
+)
+
+motor_documents = []
+
+for i, section in enumerate(motor_sections):
+
+    if len(section.strip()) > 200:
+
+        motor_documents.append(
+            Document(
+                page_content=section,
+                metadata={
+                    "source":"Motor Policy",
+                    "chunk_id":i
+                }
+            )
+        )
+
+print("Motor Chunks:", len(motor_documents))
+
+  health_text = "\n".join(
+    [doc.page_content for doc in health_docs]
+)
+
+health_sections = re.split(
+    r"CHAPTER\s+\d+",
+    health_text
+)
+
+health_documents = []
+
+for i, section in enumerate(health_sections):
+
+    if len(section.strip()) > 200:
+
+        health_documents.append(
+            Document(
+                page_content=section,
+                metadata={
+                    "source":"Health Policy",
+                    "chunk_id":i
+                }
+            )
+        )
+
+print("Health Chunks:", len(health_documents))
+
+all_documents = (
+    faq_documents +
+    motor_documents +
+    health_documents
+)
+
+print("Total Chunks:", len(all_documents))
+
+from langchain_huggingface import HuggingFaceEmbeddings
+
+embedding_model = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2"
+)
+
+from langchain_chroma import Chroma
+
+vectordb = Chroma.from_documents(
+    documents=all_documents,
+    embedding=embedding_model,
+    persist_directory="acko_vectordb"
+)
+
+print("Vector DB Created")
+
+embedding_model = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2"
+)
+
+retriever = vectordb.as_retriever(
+    search_kwargs={"k":3}
+)
+
+from langchain_google_genai import ChatGoogleGenerativeAI
+
+llm = ChatGoogleGenerativeAI(
+    model="models/gemini-2.5-flash",
+    temperature=0
+)
+
+import sqlite3
+
+conn = sqlite3.connect("chat_history.db")
+cursor = conn.cursor()
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS conversations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+    question TEXT,
+    answer TEXT,
+    sources TEXT
+)
+""")
+
+conn.commit()
+conn.close()
+
+def save_conversation(question, answer, sources):
+
+    conn = sqlite3.connect("chat_history.db")
+    cursor = conn.cursor()
+
+    cursor.execute("""
+    INSERT INTO conversations
+    (question, answer, sources)
+    VALUES (?, ?, ?)
+    """,
+    (
+        question,
+        answer,
+        ", ".join(sources)
+    ))
+
+    conn.commit()
+    conn.close()
+
+def ask_question(question):
+
+    docs = retriever.invoke(question)
+
+    context = "\n\n".join(
+        [doc.page_content for doc in docs]
+    )
+
+    sources = list(
+        set(
+            [doc.metadata["source"] for doc in docs]
+        )
+    )
+
+    prompt = f"""
+You are an ACKO Insurance Assistant.
+
+Answer only using provided context.
+
+If information is unavailable,
+say:
+'I could not find this information in the policy documents.'
+
+Context:
+{context}
+
+Question:
+{question}
+"""
+
+    response = llm.invoke(prompt)
+
+    answer = response.content
+
+    # Save conversation
+    save_conversation(
+        question,
+        answer,
+        sources
+    )
+
+    return {
+        "answer": answer,
+        "sources": sources
+    }
+result = ask_question(
+    "What is Zero Depreciation add-on?"
+)
+
+print(result["answer"])
+print("\nSources:", result["sources"])
+
+import pandas as pd
+import sqlite3
+
+conn = sqlite3.connect("chat_history.db")
+
+df = pd.read_sql(
+    "SELECT * FROM conversations ORDER BY id DESC",
+    conn
+)
+
+df.head()
+
+conn = sqlite3.connect("chat_history.db")
+
+cursor = conn.cursor()
+
+cursor.execute("""
+SELECT timestamp, question, answer
+FROM conversations
+ORDER BY id DESC
+LIMIT 5
+""")
+
+for row in cursor.fetchall():
+    print("="*80)
+    print("Time:", row[0])
+    print("Question:", row[1])
+    print("Answer:", row[2][:300])
+
+result = ask_question(
+    "What is IDV and how does it affect my car insurance premium?"
+)
+
+print(result["answer"])
+print("\nSources:", result["sources"])
+
+result = ask_question(
+    "Do I need insurance for my bike or scooter in India?"
+)
+
+print(result["answer"])
+print("\nSources:", result["sources"])
+
+result = ask_question(
+    "What is a waiting period in health insurance?"
+)
+
+print(result["answer"])
+print("\nSources:", result["sources"])
+
+conn = sqlite3.connect("chat_history.db")
+
+cursor = conn.cursor()
+
+cursor.execute("""
+SELECT timestamp, question, answer
+FROM conversations
+ORDER BY id DESC
+LIMIT 5
+""")
+
+for row in cursor.fetchall():
+    print("="*80)
+    print("Time:", row[0])
+    print("Question:", row[1])
+    print("Answer:", row[2][:300])
+
+!pip install streamlit -q
+
+!streamlit --version
+
+!wget -q -O - ipv4.icanhazip.com
+
+%%writefile app.py
+
+import streamlit as st
+import sqlite3
+import os
+
+from langchain_chroma import Chroma
+from langchain_huggingface import HuggingFaceEmbeddings
+
+embedding_model = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2"
+)
+
+vectordb = Chroma(
+    persist_directory="acko_db",
+    embedding_function=embedding_model
+)
+
+retriever = vectordb.as_retriever(
+    search_kwargs={"k":3}
+)
+
+llm = ChatGoogleGenerativeAI(
+    model="models/gemini-2.5-flash",
+    temperature=0
+)
+
+conn = sqlite3.connect(
+    "chat_history.db",
+    check_same_thread=False
+)
+
+cursor = conn.cursor()
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS conversations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    question TEXT,
+    answer TEXT,
+    sources TEXT
+)
+""")
+
+conn.commit()
+
+
+def save_conversation(question, answer, sources):
+
+    conn = sqlite3.connect("chat_history.db")
+
+    cursor = conn.cursor()
+
+    cursor.execute("""
+    INSERT INTO conversations
+    (question, answer, sources)
+    VALUES (?, ?, ?)
+    """,
+    (
+        question,
+        answer,
+        ", ".join(sources)
+    ))
+
+    conn.commit()
+    conn.close()
+
+def ask_question(question):
+
+    docs = retriever.invoke(question)
+
+    context = "\n\n".join(
+        [doc.page_content for doc in docs]
+    )
+
+    sources = list(
+        set(
+            [doc.metadata["source"] for doc in docs]
+        )
+    )
+
+    prompt = f"""
+You are an ACKO Insurance Assistant.
+
+Answer only using provided context.
+
+If information is unavailable,
+say:
+'I could not find this information in the policy documents.'
+
+Context:
+{context}
+
+Question:
+{question}
+"""
+
+    response = llm.invoke(prompt)
+
+    answer = response.content
+
+    save_conversation(
+        question,
+        answer,
+        sources
+    )
+
+    return {
+        "answer": answer,
+        "sources": sources
+    }
+
+
+st.set_page_config(
+    page_title="ACKO Insurance Assistant",
+    layout="wide"
+)
+
+st.title("ACKO Insurance Assistant")
+
+tab1, tab2, tab3 = st.tabs(
+    [
+        "FAQ Questions",
+        "Ask Question",
+        "History"
+    ]
+)
+
+with tab1:
+
+    faq_questions = [
+
+        "What is IDV in car insurance?",
+        "What does comprehensive car insurance cover?",
+        "Is car insurance mandatory in India?",
+        "What is No Claim Bonus?",
+        "How do I file a motor insurance claim?",
+        "Do I need insurance for my bike?",
+        "How much does bike insurance cost?",
+        "Can I transfer my NCB?",
+        "What is a waiting period in health insurance?",
+        "What add-ons are recommended for a new car?"
+    ]
+
+    selected_question = st.selectbox(
+        "Select a Question",
+        faq_questions
+    )
+
+    if st.button("Get Answer"):
+
+        result = ask_question(
+            selected_question
+        )
+
+        st.subheader("Answer")
+
+        st.write(
+            result["answer"]
+        )
+
+        st.subheader("Sources")
+
+        for src in result["sources"]:
+
+            st.write(
+                os.path.basename(src)
+            )
+
+with tab2:
+
+    question = st.text_area(
+        "Enter your question"
+    )
+
+    if st.button("Ask Question"):
+
+        if question.strip():
+
+            result = ask_question(
+                question
+            )
+
+            st.subheader("Answer")
+
+            st.write(
+                result["answer"]
+            )
+
+            st.subheader("Sources")
+
+            for src in result["sources"]:
+
+                st.write(
+                    os.path.basename(src)
+                )
+
+with tab3:
+
+    conn = sqlite3.connect(
+        "chat_history.db"
+    )
+
+    cursor = conn.cursor()
+
+    rows = cursor.execute("""
+    SELECT question,
+           answer,
+           sources
+    FROM conversations
+    ORDER BY id DESC
+    LIMIT 20
+    """).fetchall()
+
+    conn.close()
+
+    for q, a, s in rows:
+
+        with st.expander(q):
+
+            st.write(a)
+
+            st.write(s)
+
+  !streamlit run app.py & npx localtunnel --port 8501
