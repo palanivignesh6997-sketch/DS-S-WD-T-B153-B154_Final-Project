@@ -1,0 +1,375 @@
+
+!pip install streamlit -q
+
+!streamlit --version
+
+!wget -q -O - ipv4.icanhazip.com
+
+%%writefile app.py
+import os
+from langchain_chroma import Chroma
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_google_genai import ChatGoogleGenerativeAI
+import sqlite3
+import re
+from langchain_core.documents import Document
+from langchain_community.document_loaders import PyPDFLoader
+
+os.environ["GOOGLE_API_KEY"] = "API_Key"
+
+
+faq_docs = PyPDFLoader(
+    "Acko_Insurance_FAQs.pdf"
+).load()
+
+motor_docs = PyPDFLoader(
+    "Acko_Motor_Insurance_Policy_TC.pdf"
+).load()
+
+health_docs = PyPDFLoader(
+    "Acko_Health_Insurance_Policy_TC.pdf"
+).load()
+
+print("FAQ Pages:", len(faq_docs))
+print("Motor Pages:", len(motor_docs))
+print("Health Pages:", len(health_docs))
+
+
+
+faq_text = "\n".join(
+    [doc.page_content for doc in faq_docs]
+)
+
+pattern = r"(Q\s+[A-Z]\d+\..*?)(?=Q\s+[A-Z]\d+\.|$)"
+
+faq_chunks = re.findall(
+    pattern,
+    faq_text,
+    flags=re.DOTALL
+)
+
+faq_documents = []
+
+for i, chunk in enumerate(faq_chunks):
+
+    faq_documents.append(
+        Document(
+            page_content=chunk,
+            metadata={
+                "source":"FAQ",
+                "chunk_id":i
+            }
+        )
+    )
+
+print("FAQ Chunks:", len(faq_documents))
+
+motor_text = "\n".join(
+    [doc.page_content for doc in motor_docs]
+)
+
+motor_sections = re.split(
+    r"CHAPTER\s+\d+",
+    motor_text
+)
+
+motor_documents = []
+
+for i, section in enumerate(motor_sections):
+
+    if len(section.strip()) > 200:
+
+        motor_documents.append(
+            Document(
+                page_content=section,
+                metadata={
+                    "source":"Motor Policy",
+                    "chunk_id":i
+                }
+            )
+        )
+
+print("Motor Chunks:", len(motor_documents))
+
+health_text = "\n".join(
+    [doc.page_content for doc in health_docs]
+)
+
+health_sections = re.split(
+    r"CHAPTER\s+\d+",
+    health_text
+)
+
+health_documents = []
+
+for i, section in enumerate(health_sections):
+
+    if len(section.strip()) > 200:
+
+        health_documents.append(
+            Document(
+                page_content=section,
+                metadata={
+                    "source":"Health Policy",
+                    "chunk_id":i
+                }
+            )
+        )
+
+print("Health Chunks:", len(health_documents))
+
+all_documents = (
+    faq_documents +
+    motor_documents +
+    health_documents
+)
+
+print("Total Chunks:", len(all_documents))
+
+embedding_model = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2"
+)
+
+
+vectordb = Chroma.from_documents(
+    documents=all_documents,
+    embedding=embedding_model,
+    persist_directory="acko_vectordb"
+)
+
+print("Vector DB Created")
+
+retriever = vectordb.as_retriever(
+    search_kwargs={"k":3}
+)
+
+
+llm = ChatGoogleGenerativeAI(
+    model="models/gemini-2.5-flash",
+    temperature=0
+)
+
+
+
+conn = sqlite3.connect("chat_history.db")
+cursor = conn.cursor()
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS conversations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+    question TEXT,
+    answer TEXT,
+    sources TEXT
+)
+""")
+
+conn.commit()
+conn.close()
+
+def save_conversation(question, answer, sources):
+
+    conn = sqlite3.connect("chat_history.db")
+    cursor = conn.cursor()
+
+    cursor.execute("""
+    INSERT INTO conversations
+    (question, answer, sources)
+    VALUES (?, ?, ?)
+    """,
+    (
+        question,
+        answer,
+        ", ".join(sources)
+    ))
+
+    conn.commit()
+    conn.close()
+
+def ask_question(question):
+
+    docs = retriever.invoke(question)
+
+    context = "\n\n".join(
+        [doc.page_content for doc in docs]
+    )
+
+    sources = list(
+        set(
+            [doc.metadata["source"] for doc in docs]
+        )
+    )
+
+    prompt = f"""
+You are an ACKO Insurance Assistant.
+
+Answer only using provided context.
+
+If information is unavailable,
+say:
+'I could not find this information in the policy documents.'
+
+Context:
+{context}
+
+Question:
+{question}
+"""
+
+    response = llm.invoke(prompt)
+
+    answer = response.content
+
+    
+    save_conversation(
+        question,
+        answer,
+        sources
+    )
+
+    return {
+        "answer": answer,
+        "sources": sources
+    }
+result = ask_question(
+    "What is Zero Depreciation add-on?"
+)
+
+print(result["answer"])
+print("\nSources:", result["sources"])
+
+import pandas as pd
+import sqlite3
+
+conn = sqlite3.connect("chat_history.db")
+
+df = pd.read_sql(
+    "SELECT * FROM conversations ORDER BY id DESC",
+    conn
+)
+
+df.head()
+
+conn = sqlite3.connect("chat_history.db")
+
+cursor = conn.cursor()
+
+cursor.execute("""
+SELECT timestamp, question, answer
+FROM conversations
+ORDER BY id DESC
+LIMIT 5
+""")
+
+for row in cursor.fetchall():
+    print("="*80)
+    print("Time:", row[0])
+    print("Question:", row[1])
+    print("Answer:", row[2][:300])
+
+
+conn = sqlite3.connect("chat_history.db")
+
+cursor = conn.cursor()
+
+cursor.execute("""
+SELECT timestamp, question, answer
+FROM conversations
+ORDER BY id DESC
+LIMIT 5
+""")
+
+for row in cursor.fetchall():
+    print("="*80)
+    print("Time:", row[0])
+    print("Question:", row[1])
+    print("Answer:", row[2][:300])
+
+
+
+
+import streamlit as st
+
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_google_genai import ChatGoogleGenerativeAI
+
+embedding_model = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2"
+)
+
+vectordb = Chroma(
+    persist_directory="acko_vectordb",
+    embedding_function=embedding_model
+)
+
+retriever = vectordb.as_retriever(
+    search_kwargs={"k":3}
+)
+
+llm = ChatGoogleGenerativeAI(
+    model="gemini-2.5-flash",
+    temperature=0
+)
+
+st.set_page_config(
+    page_title="ACKO Insurance RAG Chatbot"
+)
+
+st.title("ACKO Insurance RAG Chatbot")
+
+question = st.text_input(
+    "Ask your question"
+)
+
+if st.button("Get Answer"):
+
+    if question.strip():
+
+        docs = retriever.invoke(question)
+
+        st.subheader("Retrieved Documents")
+
+        for i, doc in enumerate(docs):
+
+            st.write(f"Document {i+1}")
+
+            st.text(doc.page_content[:1000])
+
+        context = "\n\n".join(
+            [
+                doc.page_content
+                for doc in docs
+            ]
+        )
+
+        prompt = f"""
+You are an ACKO Insurance Assistant.
+
+Answer ONLY from the provided context.
+
+If the answer is not present in the context, say:
+
+I could not find this information in the policy documents.
+
+Context:
+{context}
+
+Question:
+{question}
+
+Answer:
+"""
+
+        try:
+
+            response = llm.invoke(prompt)
+
+            st.subheader("Answer")
+
+            st.write(response.content)
+
+        except Exception as e:
+
+            st.error(str(e))
+
+  !streamlit run app.py & npx localtunnel --port 8501
