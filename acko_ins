@@ -222,7 +222,6 @@ Question:
 
     answer = response.content
 
-    # Save conversation
     save_conversation(
         question,
         answer,
@@ -327,7 +326,7 @@ embedding_model = HuggingFaceEmbeddings(
 )
 
 vectordb = Chroma(
-    persist_directory="acko_db",
+    persist_directory="acko_vectordb",
     embedding_function=embedding_model
 )
 
